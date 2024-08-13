@@ -22,6 +22,7 @@ pub enum CipherMode {
     Ctr,
     Cbc,
     Gcm,
+    Ecb,
 }
 
 pub struct Sm4CipherMode {
@@ -63,6 +64,7 @@ impl Sm4CipherMode {
             CipherMode::Ctr => self.ctr_encrypt(data, iv),
             CipherMode::Cbc => self.cbc_encrypt(data, iv),
             CipherMode::Gcm => self.gcm_encrypt(aad, data, iv),
+            CipherMode::Ecb => self.ecb_encrypt(data),
         }
     }
 
@@ -76,6 +78,7 @@ impl Sm4CipherMode {
             CipherMode::Ctr => self.ctr_encrypt(data, iv),
             CipherMode::Cbc => self.cbc_decrypt(data, iv),
             CipherMode::Gcm => self.gcm_decrypt(aad, data, iv),
+            CipherMode::Ecb => self.ecb_decrypt(data),
         }
     }
 
@@ -381,6 +384,37 @@ impl Sm4CipherMode {
             Ok(data)
         }
     }
+
+    fn ecb_encrypt(&self, data: &[u8]) -> Result<Vec<u8>, Sm4Error> {
+        let data_len = data.len();
+        let block_num = data_len / 16;
+        if data_len % 16 != 0 {
+            return Err(Sm4Error::ErrorDataLen);
+        }
+        let mut out: Vec<u8> = Vec::with_capacity(data_len);
+        for i in 0..block_num {
+            let enc = self.cipher.encrypt(&data[i * 16..i * 16 + 16])?;
+            out.extend_from_slice(&enc);
+        }
+        Ok(out)
+    }
+
+    fn ecb_decrypt(&self, data: &[u8]) -> Result<Vec<u8>, Sm4Error> {
+        let data_len = data.len();
+        let block_num = data_len / 16;
+        if data_len % 16 != 0 {
+            return Err(Sm4Error::ErrorDataLen);
+        }
+        let mut out: Vec<u8> = Vec::with_capacity(data_len);
+
+        // Normal
+        for i in 0..block_num {
+            let enc = self.cipher.decrypt(&data[i * 16..i * 16 + 16])?;
+            out.extend_from_slice(&enc);
+        }
+
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -488,6 +522,39 @@ mod tests {
         let lhs: &[u8] = lhs.as_ref().unwrap();
 
         let rhs: &[u8] = include_bytes!("example/text.sms4-cbc");
+        assert_eq!(lhs, rhs);
+    }
+
+    #[test]
+    fn ecb_enc_test() {
+        let key = [
+            01, 02, 03, 04, 05, 06, 07, 08, 01, 02, 03, 04, 05, 06, 07, 08,
+        ];
+
+        let cipher_mode = Sm4CipherMode::new(&key, CipherMode::Ecb).unwrap();
+        let msg = [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8];
+        let lhs = cipher_mode.encrypt(&[], &msg, &[0; 16]);
+        let lhs: &[u8] = lhs.as_ref().unwrap();
+        let rhs: [u8; 16] = [
+            0x1C, 0x22, 0xCB, 0x0A, 0x06, 0xAF, 0x33, 0x90, 0x37, 0x2E, 0x8F, 0x8A, 0xD3, 0x20,
+            0x57, 0xA7,
+        ];
+        assert_eq!(lhs, rhs);
+    }
+
+    #[test]
+    fn ecb_dec_test() {
+        let key = [
+            01, 02, 03, 04, 05, 06, 07, 08, 01, 02, 03, 04, 05, 06, 07, 08,
+        ];
+        let cipher_mode = Sm4CipherMode::new(&key, CipherMode::Ecb).unwrap();
+        let dec = [
+            0x1C, 0x22, 0xCB, 0x0A, 0x06, 0xAF, 0x33, 0x90, 0x37, 0x2E, 0x8F, 0x8A, 0xD3, 0x20,
+            0x57, 0xA7,
+        ];
+        let lhs = cipher_mode.decrypt(&[], &dec, &[0; 16]);
+        let lhs: &[u8] = lhs.as_ref().unwrap();
+        let rhs: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8]; // [0x1C, 0x22, 0xCB, 0x0A, 0x06, 0xAF, 0x33, 0x90, 0x37, 0x2E, 0x8F, 0x8A, 0xD3, 0x20, 0x57, 0xA7];
         assert_eq!(lhs, rhs);
     }
 
