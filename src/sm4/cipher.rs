@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::sm4::error::{Sm4Error, Sm4Result};
+use crate::sm4::gcm::{bytes_to_u128array, galois_hash, gcm_block_add_one};
 
 static SBOX: [u8; 256] = [
     0xd6, 0x90, 0xe9, 0xfe, 0xcc, 0xe1, 0x3d, 0xb7, 0x16, 0xb6, 0x14, 0xc2, 0x28, 0xfb, 0x2c, 0x05,
@@ -104,9 +105,26 @@ fn t_prime_trans(input: u32) -> u32 {
     l_prime_trans(tau_trans(input))
 }
 
+fn block_xor(a: &[u8], b: &[u8]) -> [u8; 16] {
+    let mut out: [u8; 16] = [0; 16];
+    for i in 0..16 {
+        out[i] = a[i] ^ b[i];
+    }
+    out
+}
+
+fn block_add_one(a: &mut [u8]) {
+    for i in 0..16 {
+        let (t, c) = a[15 - i].overflowing_add(1);
+        a[15 - i] = t;
+        if !c {
+            return;
+        }
+    }
+}
 pub struct Sm4Cipher {
     // round key
-    rk: Vec<u32>,
+    rk: [u32;32],
 }
 
 static FK: [u32; 4] = [0xa3b1_bac6, 0x56aa_3350, 0x677d_9197, 0xb270_22dc];
@@ -149,7 +167,7 @@ static CK: [u32; 32] = [
 impl Sm4Cipher {
     pub fn new(key: &[u8]) -> Result<Sm4Cipher, Sm4Error> {
         let mut k: [u32; 4] = split_block(key)?;
-        let mut cipher = Sm4Cipher { rk: Vec::new() };
+        let mut rk = [0;32];
         for i in 0..4 {
             k[i] ^= FK[i];
         }
@@ -158,13 +176,13 @@ impl Sm4Cipher {
             k[1] ^= t_prime_trans(k[2] ^ k[3] ^ k[0] ^ CK[i * 4 + 1]);
             k[2] ^= t_prime_trans(k[3] ^ k[0] ^ k[1] ^ CK[i * 4 + 2]);
             k[3] ^= t_prime_trans(k[0] ^ k[1] ^ k[2] ^ CK[i * 4 + 3]);
-            cipher.rk.push(k[0]);
-            cipher.rk.push(k[1]);
-            cipher.rk.push(k[2]);
-            cipher.rk.push(k[3]);
+            rk[4*i] = k[0];
+            rk[4*i+1] = k[1];
+            rk[4*i+2] = k[2];
+            rk[4*i+3] = k[3];
         }
 
-        Ok(cipher)
+        Ok(Sm4Cipher{rk})
     }
 
     pub fn encrypt(&self, block_in: &[u8]) -> Result<[u8; 16], Sm4Error> {
@@ -191,6 +209,308 @@ impl Sm4Cipher {
         }
         let y = [x[3], x[2], x[1], x[0]];
         combine_block(&y)
+    }
+
+    fn cfb_encrypt(&self, data: &[u8], iv: &[u8]) -> Result<Vec<u8>, Sm4Error> {
+        let block_num = data.len() / 16;
+        let tail_len = data.len() - block_num * 16;
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut vec_buf: Vec<u8> = vec![0; 16];
+        vec_buf.clone_from_slice(iv);
+
+        // Normal
+        for i in 0..block_num {
+            let enc = self.encrypt(&vec_buf[..])?;
+            let ct = block_xor(&enc, &data[i * 16..i * 16 + 16]);
+            for i in ct.iter() {
+                out.push(*i);
+            }
+            vec_buf.clone_from_slice(&ct);
+        }
+
+        // Last block
+        let enc = self.encrypt(&vec_buf[..])?;
+        for i in 0..tail_len {
+            let b = data[block_num * 16 + i] ^ enc[i];
+            out.push(b);
+        }
+        Ok(out)
+    }
+    fn cfb_decrypt(&self, data: &[u8], iv: &[u8]) -> Result<Vec<u8>, Sm4Error> {
+        let block_num = data.len() / 16;
+        let tail_len = data.len() - block_num * 16;
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut vec_buf: Vec<u8> = vec![0; 16];
+        vec_buf.clone_from_slice(iv);
+
+        // Normal
+        for i in 0..block_num {
+            let enc = self.encrypt(&vec_buf[..])?;
+            let ct = &data[i * 16..i * 16 + 16];
+            let pt = block_xor(&enc, ct);
+            for i in pt.iter() {
+                out.push(*i);
+            }
+            vec_buf.clone_from_slice(ct);
+        }
+
+        // Last block
+        let enc = self.encrypt(&vec_buf[..])?;
+        for i in 0..tail_len {
+            let b = data[block_num * 16 + i] ^ enc[i];
+            out.push(b);
+        }
+        Ok(out)
+    }
+
+    fn ofb_encrypt(&self, data: &[u8], iv: &[u8]) -> Result<Vec<u8>, Sm4Error> {
+        let block_num = data.len() / 16;
+        let tail_len = data.len() - block_num * 16;
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut vec_buf: Vec<u8> = vec![0; 16];
+        vec_buf.clone_from_slice(iv);
+
+        // Normal
+        for i in 0..block_num {
+            let enc = self.encrypt(&vec_buf[..])?;
+            let ct = block_xor(&enc, &data[i * 16..i * 16 + 16]);
+            for i in ct.iter() {
+                out.push(*i);
+            }
+            vec_buf.clone_from_slice(&enc);
+        }
+
+        // Last block
+        let enc = self.encrypt(&vec_buf[..])?;
+        for i in 0..tail_len {
+            let b = data[block_num * 16 + i] ^ enc[i];
+            out.push(b);
+        }
+        Ok(out)
+    }
+
+    fn ctr_encrypt(&self, data: &[u8], iv: &[u8]) -> Result<Vec<u8>, Sm4Error> {
+        let block_num = data.len() / 16;
+        let tail_len = data.len() - block_num * 16;
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut vec_buf: Vec<u8> = vec![0; 16];
+        vec_buf.clone_from_slice(iv);
+
+        // Normal
+        for i in 0..block_num {
+            let enc = self.encrypt(&vec_buf[..])?;
+            let ct = block_xor(&enc, &data[i * 16..i * 16 + 16]);
+            for i in ct.iter() {
+                out.push(*i);
+            }
+            block_add_one(&mut vec_buf[..]);
+        }
+
+        // Last block
+        let enc = self.encrypt(&vec_buf[..])?;
+        for i in 0..tail_len {
+            let b = data[block_num * 16 + i] ^ enc[i];
+            out.push(b);
+        }
+        Ok(out)
+    }
+
+    fn cbc_encrypt(&self, data: &[u8], iv: &[u8]) -> Result<Vec<u8>, Sm4Error> {
+        let block_num = data.len() / 16;
+        let remind = data.len() % 16;
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut vec_buf = [0; 16];
+        vec_buf.copy_from_slice(iv);
+
+        // Normal
+        for i in 0..block_num {
+            let ct =block_xor(&vec_buf, &data[i * 16..i * 16 + 16]);
+            let enc = self.encrypt(&ct)?;
+
+            out.extend_from_slice(&enc);
+            vec_buf = enc;
+        }
+
+        if remind != 0 {
+            let mut last_block = [16 - remind as u8; 16];
+            last_block[..remind].copy_from_slice(&data[block_num * 16..]);
+
+            let ct = block_xor(&vec_buf, &last_block);
+            let enc = self.encrypt(&ct)?;
+            out.extend_from_slice(&enc);
+        } else {
+            let ff_padding =block_xor(&vec_buf, &[0x10; 16]);
+            let enc = self.encrypt(&ff_padding)?;
+            out.extend_from_slice(&enc);
+        }
+
+        Ok(out)
+    }
+
+    fn cbc_decrypt(&self, data: &[u8], iv: &[u8]) -> Result<Vec<u8>, Sm4Error> {
+        let data_len = data.len();
+        let block_num = data_len / 16;
+        if data_len % 16 != 0 {
+            return Err(Sm4Error::ErrorDataLen);
+        }
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut vec_buf = [0; 16];
+        vec_buf.copy_from_slice(iv);
+
+        // Normal
+        for i in 0..block_num {
+            let enc = self.decrypt(&data[i * 16..i * 16 + 16])?;
+            let ct = block_xor(&vec_buf, &enc);
+
+            for j in ct.iter() {
+                out.push(*j);
+            }
+            vec_buf.copy_from_slice(&data[i * 16..i * 16 + 16]);
+        }
+
+        let last_u8 = out[data_len - 1];
+        if last_u8 > 0x10 || last_u8 == 0 {
+            return Err(Sm4Error::InvalidLastU8);
+        }
+        out.resize(data_len - last_u8 as usize, 0);
+
+        Ok(out)
+    }
+
+    fn galois_ctr(&self, data: &[u8], iv: &[u8]) -> Result<Vec<u8>, Sm4Error> {
+        if data.is_empty() {
+            Ok(vec![])
+        } else {
+            let block_num = data.len() / 16;
+            let remind = data.len() % 16;
+
+            let mut out: Vec<u8> = Vec::new();
+            let mut cb = [0; 16];
+            cb.copy_from_slice(iv);
+
+            for i in 0..block_num {
+                let yi = block_xor(&data[i * 16..i * 16 + 16], &self.encrypt(&cb)?);
+                out.extend_from_slice(&yi);
+                gcm_block_add_one(&mut cb);
+            }
+
+            for i in 0..remind {
+                let enc = self.encrypt(&cb)?;
+                let b = data[block_num * 16 + i] ^ enc[i];
+                out.push(b);
+            }
+            Ok(out)
+        }
+    }
+
+    fn gcm_encrypt(&self, aad: &[u8], data: &[u8], iv: &[u8]) -> Result<Vec<u8>, Sm4Error> {
+        let h = u128::from_be_bytes(self.encrypt(&[0; 16])?);
+
+        // iv must be 128 bit, but we also consider 96 bit and others
+        // as nist 800-38d specified
+        let mut j0 = vec![];
+        let iv_len = iv.len();
+        if iv_len == 12 {
+            j0.extend_from_slice(iv);
+            j0.extend_from_slice(&[0, 0, 0, 1]);
+        } else {
+            let mut iv_padding = vec![];
+            let s = 16 * ((iv_len + 15) / 16) - iv_len;
+            iv_padding.extend_from_slice(iv);
+            iv_padding.extend_from_slice(&vec![0; s + 8]);
+            #[cfg(target_pointer_width = "32")]
+            let iv_len = iv_len as u64;
+            iv_padding.extend_from_slice(&(iv_len * 8).to_be_bytes());
+            let j0_128 = galois_hash(h, &bytes_to_u128array(&iv_padding));
+            j0.extend_from_slice(&j0_128.to_be_bytes());
+        }
+
+        let mut j0_enc = j0.clone();
+        gcm_block_add_one(&mut j0_enc);
+        let mut enc = self.galois_ctr(data, &j0_enc)?;
+
+        let aad_len = aad.len();
+        let enc_len = enc.len();
+        let u = 16 * ((enc_len + 15) / 16) - enc_len;
+        let v = 16 * ((aad_len + 15) / 16) - aad_len;
+
+        let mut tag_padding = vec![];
+        tag_padding.extend_from_slice(aad);
+        tag_padding.extend_from_slice(&vec![0; v]);
+        tag_padding.extend_from_slice(&enc);
+        tag_padding.extend_from_slice(&vec![0; u]);
+        #[cfg(target_pointer_width = "32")]
+        let aad_len = aad_len as u64;
+        tag_padding.extend_from_slice(&(aad_len * 8).to_be_bytes());
+        #[cfg(target_pointer_width = "32")]
+        let enc_len = enc_len as u64;
+        tag_padding.extend_from_slice(&(enc_len * 8).to_be_bytes());
+        let tag_hash = galois_hash(h, &bytes_to_u128array(&tag_padding));
+        let tag_crt = self.galois_ctr(&tag_hash.to_be_bytes(), &j0)?;
+
+        enc.extend_from_slice(&tag_crt);
+        Ok(enc)
+    }
+
+    fn gcm_decrypt(&self, aad: &[u8], data: &[u8], iv: &[u8]) -> Result<Vec<u8>, Sm4Error> {
+        let tag = &data[data.len() - 16..];
+        let enc = &data[..data.len() - 16];
+
+        let h = u128::from_be_bytes(self.encrypt(&[0; 16])?);
+
+        // iv must be 128 bit, but we also consider 96 bit and others
+        // as nist 800-38d specified
+        let mut j0 = vec![];
+        let iv_len = iv.len();
+        if iv_len == 12 {
+            j0.extend_from_slice(iv);
+            j0.extend_from_slice(&[0, 0, 0, 1]);
+        } else {
+            let mut iv_padding = vec![];
+            let s = 16 * ((iv_len + 15) / 16) - iv_len;
+            iv_padding.extend_from_slice(iv);
+            iv_padding.extend_from_slice(&vec![0; s + 8]);
+            #[cfg(target_pointer_width = "32")]
+            let iv_len = iv_len as u64;
+            iv_padding.extend_from_slice(&(iv_len * 8).to_be_bytes());
+            let j0_128 = galois_hash(h, &bytes_to_u128array(&iv_padding));
+            j0.extend_from_slice(&j0_128.to_be_bytes());
+        }
+
+        let mut j0_enc = j0.clone();
+        gcm_block_add_one(&mut j0_enc);
+        let data = self.galois_ctr(enc, &j0_enc)?;
+
+        let aad_len = aad.len();
+        let enc_len = enc.len();
+        let u = 16 * ((enc_len + 15) / 16) - enc_len;
+        let v = 16 * ((aad_len + 15) / 16) - aad_len;
+
+        let mut tag_padding = vec![];
+        tag_padding.extend_from_slice(aad);
+        tag_padding.extend_from_slice(&vec![0; v]);
+        tag_padding.extend_from_slice(enc);
+        tag_padding.extend_from_slice(&vec![0; u]);
+        #[cfg(target_pointer_width = "32")]
+        let aad_len = aad_len as u64;
+        tag_padding.extend_from_slice(&(aad_len * 8).to_be_bytes());
+        #[cfg(target_pointer_width = "32")]
+        let enc_len = enc_len as u64;
+        tag_padding.extend_from_slice(&(enc_len * 8).to_be_bytes());
+        let tag_hash = galois_hash(h, &bytes_to_u128array(&tag_padding));
+        let tag_crt = self.galois_ctr(&tag_hash.to_be_bytes(), &j0)?;
+
+        if tag != tag_crt {
+            Err(Sm4Error::InvalidTag)
+        } else {
+            Ok(data)
+        }
     }
 }
 
